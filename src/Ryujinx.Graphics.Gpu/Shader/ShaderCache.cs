@@ -78,6 +78,7 @@ namespace Ryujinx.Graphics.Gpu.Shader
         private ComputeShaderCacheHashTable _computeShaderCache;
         private ShaderCacheHashTable _graphicsShaderCache;
         private readonly DiskCacheHostStorage _diskCacheHostStorage;
+          private readonly BackgroundDiskCacheWriter _cacheWriter;
         // === RAM LRU eviction ===
           private readonly LinkedList<CachedShaderProgram> _lruList = new();
           private readonly Dictionary<CachedShaderProgram, LinkedListNode<CachedShaderProgram>> _lruNodeMap = new();
