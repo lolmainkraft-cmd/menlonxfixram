@@ -11,7 +11,8 @@ using Ryujinx.Graphics.Shader.Translation;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Threading;
+using System.Linq;
+  using System.Threading;
 
 namespace Ryujinx.Graphics.Gpu.Shader
 {
@@ -74,10 +75,15 @@ namespace Ryujinx.Graphics.Gpu.Shader
 
         private readonly Queue<ProgramToSave> _programsToSaveQueue;
 
-        private readonly ComputeShaderCacheHashTable _computeShaderCache;
-        private readonly ShaderCacheHashTable _graphicsShaderCache;
+        private ComputeShaderCacheHashTable _computeShaderCache;
+        private ShaderCacheHashTable _graphicsShaderCache;
         private readonly DiskCacheHostStorage _diskCacheHostStorage;
-        private readonly BackgroundDiskCacheWriter _cacheWriter;
+        // === RAM LRU eviction ===
+          private readonly LinkedList<CachedShaderProgram> _lruList = new();
+          private readonly Dictionary<CachedShaderProgram, LinkedListNode<CachedShaderProgram>> _lruNodeMap = new();
+          private readonly Dictionary<CachedShaderProgram, ulong> _cpProgramKeyMap = new();
+          private readonly Dictionary<CachedShaderProgram, ShaderAddresses> _gpProgramKeyMap = new();
+          private const int MaxCachedPrograms = 256;
 
         /// <summary>
         /// Event for signalling shader cache loading progress.
@@ -206,12 +212,14 @@ namespace Ryujinx.Graphics.Gpu.Shader
         {
             if (_cpPrograms.TryGetValue(gpuVa, out var cpShader) && IsShaderEqual(channel, poolState, computeState, cpShader, gpuVa))
             {
+                TouchLru(cpShader);
                 return cpShader;
             }
 
             if (_computeShaderCache.TryFind(channel, poolState, computeState, gpuVa, out cpShader, out byte[] cachedGuestCode))
             {
                 _cpPrograms[gpuVa] = cpShader;
+                TouchLru(cpShader);
                 return cpShader;
             }
 
@@ -232,6 +240,7 @@ namespace Ryujinx.Graphics.Gpu.Shader
             _computeShaderCache.Add(cpShader);
             EnqueueProgramToSave(cpShader, hostProgram, shaderSourcesArray);
             _cpPrograms[gpuVa] = cpShader;
+            AddComputeToLru(cpShader, gpuVa);
 
             return cpShader;
         }
@@ -309,12 +318,14 @@ namespace Ryujinx.Graphics.Gpu.Shader
         {
             if (_gpPrograms.TryGetValue(addresses, out var gpShaders) && IsShaderEqual(channel, ref poolState, ref graphicsState, gpShaders, addresses))
             {
+                TouchLru(gpShaders);
                 return gpShaders;
             }
 
             if (_graphicsShaderCache.TryFind(channel, ref poolState, ref graphicsState, addresses, out gpShaders, out var cachedGuestCode))
             {
                 _gpPrograms[addresses] = gpShaders;
+                TouchLru(gpShaders);
                 return gpShaders;
             }
 
@@ -469,6 +480,7 @@ namespace Ryujinx.Graphics.Gpu.Shader
             }
 
             _gpPrograms[addresses] = gpShaders;
+            AddGraphicsToLru(gpShaders, addresses);
 
             return gpShaders;
         }
@@ -840,7 +852,47 @@ namespace Ryujinx.Graphics.Gpu.Shader
         /// Disposes the shader cache, deleting all the cached shaders.
         /// It's an error to use the shader cache after disposal.
         /// </summary>
-        public void Dispose()
+        private void TouchLru(CachedShaderProgram program)
+          {
+              if (_lruNodeMap.TryGetValue(program, out var node))
+              { _lruList.Remove(node); _lruList.AddFirst(node); }
+          }
+          private void AddComputeToLru(CachedShaderProgram program, ulong gpuVa)
+          {
+              if (!_lruNodeMap.ContainsKey(program))
+              { _lruNodeMap[program] = _lruList.AddFirst(program); _cpProgramKeyMap[program] = gpuVa; }
+              TrimCacheIfNeeded();
+          }
+          private void AddGraphicsToLru(CachedShaderProgram program, ShaderAddresses addresses)
+          {
+              if (!_lruNodeMap.ContainsKey(program))
+              { _lruNodeMap[program] = _lruList.AddFirst(program); _gpProgramKeyMap[program] = addresses; }
+              TrimCacheIfNeeded();
+          }
+          private void TrimCacheIfNeeded()
+          {
+              if (_lruList.Count <= MaxCachedPrograms) return;
+              int evictCount = MaxCachedPrograms / 4;
+              var toEvict = new List<CachedShaderProgram>(evictCount);
+              for (int i = 0; i < evictCount && _lruList.Last != null; i++)
+              { var n = _lruList.Last; toEvict.Add(n.Value); _lruNodeMap.Remove(n.Value); _lruList.Remove(n); }
+              var evicted = new HashSet<CachedShaderProgram>(toEvict);
+              foreach (var p in toEvict)
+              {
+                  if (_cpProgramKeyMap.TryGetValue(p, out ulong ck)) { _cpPrograms.Remove(ck); _cpProgramKeyMap.Remove(p); }
+                  if (_gpProgramKeyMap.TryGetValue(p, out ShaderAddresses gk)) { _gpPrograms.Remove(gk); _gpProgramKeyMap.Remove(p); }
+              }
+              var kc = _computeShaderCache.GetPrograms().Where(p => !evicted.Contains(p)).ToList();
+              var kg = _graphicsShaderCache.GetPrograms().Where(p => !evicted.Contains(p)).ToList();
+              _computeShaderCache = new ComputeShaderCacheHashTable();
+              _graphicsShaderCache = new ShaderCacheHashTable();
+              foreach (var p in kc) _computeShaderCache.Add(p);
+              foreach (var p in kg) _graphicsShaderCache.Add(p);
+              foreach (var p in toEvict) p.Dispose();
+              Logger.Info?.Print(LogClass.Gpu, $"Shader RAM cache trimmed: evicted {evictCount}, remaining {_lruList.Count}/{MaxCachedPrograms}.");
+          }
+
+          public void Dispose()
         {
             foreach (CachedShaderProgram program in _graphicsShaderCache.GetPrograms())
             {
@@ -851,7 +903,10 @@ namespace Ryujinx.Graphics.Gpu.Shader
             {
                 program.Dispose();
             }
-
+            _lruList.Clear();
+            _lruNodeMap.Clear();
+            _cpProgramKeyMap.Clear();
+            _gpProgramKeyMap.Clear();
             _cacheWriter?.Dispose();
         }
     }
