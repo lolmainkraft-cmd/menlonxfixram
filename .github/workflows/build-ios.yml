@@ -1,57 +1,59 @@
-  name: Build iOS IPA                                                                                                                                                                                              
-  on:                                                                                                                                                                                                                  workflow_dispatch:
+name: Build iOS IPA
 
-  jobs:
-    build-ios:
-      runs-on: macos-15
-      timeout-minutes: 120
+on:
+  workflow_dispatch:
 
-      steps:
-        - name: Checkout
-          uses: actions/checkout@v4
+jobs:
+  build-ios:
+    runs-on: macos-15
+    timeout-minutes: 120
 
-        - name: Setup .NET 8
-          uses: actions/setup-dotnet@v4
-          with:
-            dotnet-version: '8.0.x'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
-        - name: Install iOS workload
-          run: dotnet workload install ios
+      - name: Setup .NET 8
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
 
-        - name: Build Ryujinx.Headless.SDL2 for iOS ARM64
-          run: |
-            dotnet publish -c Release -r ios-arm64 \
-              -p:ExtraDefineConstants=DISABLE_UPDATER \
-              src/Ryujinx.Headless.SDL2 \
-              --self-contained true
+      - name: Install iOS workload
+        run: dotnet workload install ios
 
-        - name: Move dylib into Xcode project
-          run: |
-            mv "src/Ryujinx.Headless.SDL2/bin/Release/net8.0/ios-arm64/native/Ryujinx.Headless.SDL2.dylib" \
-               "src/MeloNX/MeloNX/Dependencies/Dynamic Libraries/Ryujinx.Headless.SDL2.dylib"
+      - name: Build Ryujinx.Headless.SDL2 for iOS ARM64
+        run: |
+          dotnet publish -c Release -r ios-arm64 \
+            -p:ExtraDefineConstants=DISABLE_UPDATER \
+            src/Ryujinx.Headless.SDL2 \
+            --self-contained true
 
-        - name: Build iOS Archive
-          run: |
-            xcodebuild archive \
-              -project src/MeloNX/MeloNX.xcodeproj \
-              -scheme MeloNX \
-              -destination "generic/platform=iOS" \
-              -archivePath $RUNNER_TEMP/MeloNX.xcarchive \
-              CODE_SIGNING_ALLOWED=NO \
-              CODE_SIGN_IDENTITY="" \
-              CODE_SIGNING_REQUIRED=NO
+      - name: Move dylib into Xcode project
+        run: |
+          mv "src/Ryujinx.Headless.SDL2/bin/Release/net8.0/ios-arm64/native/Ryujinx.Headless.SDL2.dylib" \
+             "src/MeloNX/MeloNX/Dependencies/Dynamic Libraries/Ryujinx.Headless.SDL2.dylib"
 
-        - name: Package IPA
-          run: |
-            mkdir -p $RUNNER_TEMP/Payload
-            cp -r "$RUNNER_TEMP/MeloNX.xcarchive/Products/Applications/MeloNX.app" \
-                  "$RUNNER_TEMP/Payload/"
-            cd $RUNNER_TEMP
-            zip -r MeloNX-ramfix.ipa Payload/
+      - name: Build iOS Archive
+        run: |
+          xcodebuild archive \
+            -project src/MeloNX/MeloNX.xcodeproj \
+            -scheme MeloNX \
+            -destination "generic/platform=iOS" \
+            -archivePath $RUNNER_TEMP/MeloNX.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO
 
-        - name: Upload IPA
-          uses: actions/upload-artifact@v4
-          with:
-            name: MeloNX-ramfix
-            path: ${{ runner.temp }}/MeloNX-ramfix.ipa
-            retention-days: 7 
+      - name: Package IPA
+        run: |
+          mkdir -p $RUNNER_TEMP/Payload
+          cp -r "$RUNNER_TEMP/MeloNX.xcarchive/Products/Applications/MeloNX.app" \
+                "$RUNNER_TEMP/Payload/"
+          cd $RUNNER_TEMP
+          zip -r MeloNX-ramfix.ipa Payload/
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: MeloNX-ramfix
+          path: ${{ runner.temp }}/MeloNX-ramfix.ipa
+          retention-days: 7
