@@ -208,6 +208,9 @@ namespace Ryujinx.Graphics.Gpu.Shader
                 return;
             }
 
+            // Always update timestamp so WorkingSet is only called once per cooldown period
+            _lastEviction = now;
+
             long usedMemory = Environment.WorkingSet;
 
             double evictRatio = usedMemory switch
@@ -221,7 +224,6 @@ namespace Ryujinx.Graphics.Gpu.Shader
 
             if (evictRatio > 0.0)
             {
-                _lastEviction = now;
                 EvictGraphicsShaders(evictRatio);
             }
         }
