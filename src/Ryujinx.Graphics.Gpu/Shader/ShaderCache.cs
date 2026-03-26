@@ -11,8 +11,7 @@ using Ryujinx.Graphics.Shader.Translation;
 using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Linq;
-  using System.Threading;
+using System.Threading;
 
 namespace Ryujinx.Graphics.Gpu.Shader
 {
@@ -25,6 +24,17 @@ namespace Ryujinx.Graphics.Gpu.Shader
         /// Default flags used on the shader translation process.
         /// </summary>
         public const TranslationFlags DefaultFlags = TranslationFlags.DebugMode;
+
+        // Memory pressure thresholds (bytes). Eviction kicks in progressively
+        // to keep RAM usage between ~6.8 GB and ~7.7 GB on 8 GB devices.
+        private const long EvictThreshold1 = (long)(7.0 * 1024 * 1024 * 1024); // 20% evict
+        private const long EvictThreshold2 = (long)(7.3 * 1024 * 1024 * 1024); // 40% evict
+        private const long EvictThreshold3 = (long)(7.5 * 1024 * 1024 * 1024); // 60% evict
+        private const long EvictThreshold4 = (long)(7.7 * 1024 * 1024 * 1024); // 75% evict (emergency)
+
+        // Minimum time between eviction passes to avoid thrashing
+        private static readonly TimeSpan EvictionCooldown = TimeSpan.FromSeconds(2);
+        private DateTime _lastEviction = DateTime.MinValue;
 
         private readonly struct TranslatedShader
         {
@@ -75,16 +85,10 @@ namespace Ryujinx.Graphics.Gpu.Shader
 
         private readonly Queue<ProgramToSave> _programsToSaveQueue;
 
-        private ComputeShaderCacheHashTable _computeShaderCache;
-        private ShaderCacheHashTable _graphicsShaderCache;
+        private readonly ComputeShaderCacheHashTable _computeShaderCache;
+        private readonly ShaderCacheHashTable _graphicsShaderCache;
         private readonly DiskCacheHostStorage _diskCacheHostStorage;
-          private readonly BackgroundDiskCacheWriter _cacheWriter;
-        // === RAM LRU eviction ===
-          private readonly LinkedList<CachedShaderProgram> _lruList = new();
-          private readonly Dictionary<CachedShaderProgram, LinkedListNode<CachedShaderProgram>> _lruNodeMap = new();
-          private readonly Dictionary<CachedShaderProgram, ulong> _cpProgramKeyMap = new();
-          private readonly Dictionary<CachedShaderProgram, ShaderAddresses> _gpProgramKeyMap = new();
-          private const int MaxCachedPrograms = 256;
+        private readonly BackgroundDiskCacheWriter _cacheWriter;
 
         /// <summary>
         /// Event for signalling shader cache loading progress.
@@ -193,6 +197,60 @@ namespace Ryujinx.Graphics.Gpu.Shader
         }
 
         /// <summary>
+        /// Checks current process memory usage and evicts least recently used graphics shaders
+        /// if one of the configured thresholds is exceeded. Has a cooldown to avoid thrashing.
+        /// </summary>
+        private void CheckMemoryPressure()
+        {
+            DateTime now = DateTime.UtcNow;
+            if (now - _lastEviction < EvictionCooldown)
+            {
+                return;
+            }
+
+            long usedMemory = Environment.WorkingSet;
+
+            double evictRatio = usedMemory switch
+            {
+                >= EvictThreshold4 => 0.75,
+                >= EvictThreshold3 => 0.60,
+                >= EvictThreshold2 => 0.40,
+                >= EvictThreshold1 => 0.20,
+                _ => 0.0
+            };
+
+            if (evictRatio > 0.0)
+            {
+                _lastEviction = now;
+                EvictGraphicsShaders(evictRatio);
+            }
+        }
+
+        /// <summary>
+        /// Evicts a fraction of the least recently used graphics shader programs to free RAM.
+        /// Also clears the fast-path address dict to avoid dangling references.
+        /// </summary>
+        /// <param name="ratio">Fraction of cached shader combos to evict (0.0–1.0)</param>
+        private void EvictGraphicsShaders(double ratio)
+        {
+            int total = _graphicsShaderCache.ShaderComboCount;
+            int toEvict = Math.Max(1, (int)(total * ratio));
+
+            List<CachedShaderProgram> evicted = _graphicsShaderCache.EvictLeastRecentlyUsed(toEvict);
+
+            foreach (CachedShaderProgram program in evicted)
+            {
+                program.Dispose();
+            }
+
+            // Clear fast-path dict — entries may point to now-disposed programs
+            _gpPrograms.Clear();
+
+            long ramMB = Environment.WorkingSet / (1024 * 1024);
+            Logger.Info?.Print(LogClass.Gpu, $"[RamFix] Evicted {evicted.Count} shader programs ({toEvict} combos, ratio {ratio:P0}). RAM after: {ramMB} MB");
+        }
+
+        /// <summary>
         /// Gets a compute shader from the cache.
         /// </summary>
         /// <remarks>
@@ -213,14 +271,12 @@ namespace Ryujinx.Graphics.Gpu.Shader
         {
             if (_cpPrograms.TryGetValue(gpuVa, out var cpShader) && IsShaderEqual(channel, poolState, computeState, cpShader, gpuVa))
             {
-                TouchLru(cpShader);
                 return cpShader;
             }
 
             if (_computeShaderCache.TryFind(channel, poolState, computeState, gpuVa, out cpShader, out byte[] cachedGuestCode))
             {
                 _cpPrograms[gpuVa] = cpShader;
-                TouchLru(cpShader);
                 return cpShader;
             }
 
@@ -241,7 +297,8 @@ namespace Ryujinx.Graphics.Gpu.Shader
             _computeShaderCache.Add(cpShader);
             EnqueueProgramToSave(cpShader, hostProgram, shaderSourcesArray);
             _cpPrograms[gpuVa] = cpShader;
-            AddComputeToLru(cpShader, gpuVa);
+
+            CheckMemoryPressure();
 
             return cpShader;
         }
@@ -319,14 +376,12 @@ namespace Ryujinx.Graphics.Gpu.Shader
         {
             if (_gpPrograms.TryGetValue(addresses, out var gpShaders) && IsShaderEqual(channel, ref poolState, ref graphicsState, gpShaders, addresses))
             {
-                TouchLru(gpShaders);
                 return gpShaders;
             }
 
             if (_graphicsShaderCache.TryFind(channel, ref poolState, ref graphicsState, addresses, out gpShaders, out var cachedGuestCode))
             {
                 _gpPrograms[addresses] = gpShaders;
-                TouchLru(gpShaders);
                 return gpShaders;
             }
 
@@ -481,7 +536,8 @@ namespace Ryujinx.Graphics.Gpu.Shader
             }
 
             _gpPrograms[addresses] = gpShaders;
-            AddGraphicsToLru(gpShaders, addresses);
+
+            CheckMemoryPressure();
 
             return gpShaders;
         }
@@ -853,47 +909,7 @@ namespace Ryujinx.Graphics.Gpu.Shader
         /// Disposes the shader cache, deleting all the cached shaders.
         /// It's an error to use the shader cache after disposal.
         /// </summary>
-        private void TouchLru(CachedShaderProgram program)
-          {
-              if (_lruNodeMap.TryGetValue(program, out var node))
-              { _lruList.Remove(node); _lruList.AddFirst(node); }
-          }
-          private void AddComputeToLru(CachedShaderProgram program, ulong gpuVa)
-          {
-              if (!_lruNodeMap.ContainsKey(program))
-              { _lruNodeMap[program] = _lruList.AddFirst(program); _cpProgramKeyMap[program] = gpuVa; }
-              TrimCacheIfNeeded();
-          }
-          private void AddGraphicsToLru(CachedShaderProgram program, ShaderAddresses addresses)
-          {
-              if (!_lruNodeMap.ContainsKey(program))
-              { _lruNodeMap[program] = _lruList.AddFirst(program); _gpProgramKeyMap[program] = addresses; }
-              TrimCacheIfNeeded();
-          }
-          private void TrimCacheIfNeeded()
-          {
-              if (_lruList.Count <= MaxCachedPrograms) return;
-              int evictCount = MaxCachedPrograms / 4;
-              var toEvict = new List<CachedShaderProgram>(evictCount);
-              for (int i = 0; i < evictCount && _lruList.Last != null; i++)
-              { var n = _lruList.Last; toEvict.Add(n.Value); _lruNodeMap.Remove(n.Value); _lruList.Remove(n); }
-              var evicted = new HashSet<CachedShaderProgram>(toEvict);
-              foreach (var p in toEvict)
-              {
-                  if (_cpProgramKeyMap.TryGetValue(p, out ulong ck)) { _cpPrograms.Remove(ck); _cpProgramKeyMap.Remove(p); }
-                  if (_gpProgramKeyMap.TryGetValue(p, out ShaderAddresses gk)) { _gpPrograms.Remove(gk); _gpProgramKeyMap.Remove(p); }
-              }
-              var kc = _computeShaderCache.GetPrograms().Where(p => !evicted.Contains(p)).ToList();
-              var kg = _graphicsShaderCache.GetPrograms().Where(p => !evicted.Contains(p)).ToList();
-              _computeShaderCache = new ComputeShaderCacheHashTable();
-              _graphicsShaderCache = new ShaderCacheHashTable();
-              foreach (var p in kc) _computeShaderCache.Add(p);
-              foreach (var p in kg) _graphicsShaderCache.Add(p);
-              foreach (var p in toEvict) p.Dispose();
-              Logger.Info?.Print(LogClass.Gpu, $"Shader RAM cache trimmed: evicted {evictCount}, remaining {_lruList.Count}/{MaxCachedPrograms}.");
-          }
-
-          public void Dispose()
+        public void Dispose()
         {
             foreach (CachedShaderProgram program in _graphicsShaderCache.GetPrograms())
             {
@@ -904,10 +920,7 @@ namespace Ryujinx.Graphics.Gpu.Shader
             {
                 program.Dispose();
             }
-            _lruList.Clear();
-            _lruNodeMap.Clear();
-            _cpProgramKeyMap.Clear();
-            _gpProgramKeyMap.Clear();
+
             _cacheWriter?.Dispose();
         }
     }
