@@ -25,6 +25,17 @@ namespace Ryujinx.Graphics.Gpu.Shader
         /// </summary>
         public const TranslationFlags DefaultFlags = TranslationFlags.DebugMode;
 
+        // Memory pressure thresholds (bytes). Eviction kicks in progressively
+        // to keep RAM usage between ~6.8 GB and ~7.7 GB on 8 GB devices.
+        private const long EvictThreshold1 = (long)(7.0 * 1024 * 1024 * 1024); // 20% evict
+        private const long EvictThreshold2 = (long)(7.3 * 1024 * 1024 * 1024); // 40% evict
+        private const long EvictThreshold3 = (long)(7.5 * 1024 * 1024 * 1024); // 60% evict
+        private const long EvictThreshold4 = (long)(7.7 * 1024 * 1024 * 1024); // 75% evict (emergency)
+
+        // Minimum time between eviction passes to avoid thrashing
+        private static readonly TimeSpan EvictionCooldown = TimeSpan.FromSeconds(2);
+        private DateTime _lastEviction = DateTime.MinValue;
+
         private readonly struct TranslatedShader
         {
             public readonly CachedShaderStage Shader;
@@ -186,6 +197,60 @@ namespace Ryujinx.Graphics.Gpu.Shader
         }
 
         /// <summary>
+        /// Checks current process memory usage and evicts least recently used graphics shaders
+        /// if one of the configured thresholds is exceeded. Has a cooldown to avoid thrashing.
+        /// </summary>
+        private void CheckMemoryPressure()
+        {
+            DateTime now = DateTime.UtcNow;
+            if (now - _lastEviction < EvictionCooldown)
+            {
+                return;
+            }
+
+            long usedMemory = Environment.WorkingSet;
+
+            double evictRatio = usedMemory switch
+            {
+                >= EvictThreshold4 => 0.75,
+                >= EvictThreshold3 => 0.60,
+                >= EvictThreshold2 => 0.40,
+                >= EvictThreshold1 => 0.20,
+                _ => 0.0
+            };
+
+            if (evictRatio > 0.0)
+            {
+                _lastEviction = now;
+                EvictGraphicsShaders(evictRatio);
+            }
+        }
+
+        /// <summary>
+        /// Evicts a fraction of the least recently used graphics shader programs to free RAM.
+        /// Also clears the fast-path address dict to avoid dangling references.
+        /// </summary>
+        /// <param name="ratio">Fraction of cached shader combos to evict (0.0–1.0)</param>
+        private void EvictGraphicsShaders(double ratio)
+        {
+            int total = _graphicsShaderCache.ShaderComboCount;
+            int toEvict = Math.Max(1, (int)(total * ratio));
+
+            List<CachedShaderProgram> evicted = _graphicsShaderCache.EvictLeastRecentlyUsed(toEvict);
+
+            foreach (CachedShaderProgram program in evicted)
+            {
+                program.Dispose();
+            }
+
+            // Clear fast-path dict — entries may point to now-disposed programs
+            _gpPrograms.Clear();
+
+            long ramMB = Environment.WorkingSet / (1024 * 1024);
+            Logger.Info?.Print(LogClass.Gpu, $"[RamFix] Evicted {evicted.Count} shader programs ({toEvict} combos, ratio {ratio:P0}). RAM after: {ramMB} MB");
+        }
+
+        /// <summary>
         /// Gets a compute shader from the cache.
         /// </summary>
         /// <remarks>
@@ -232,6 +297,8 @@ namespace Ryujinx.Graphics.Gpu.Shader
             _computeShaderCache.Add(cpShader);
             EnqueueProgramToSave(cpShader, hostProgram, shaderSourcesArray);
             _cpPrograms[gpuVa] = cpShader;
+
+            CheckMemoryPressure();
 
             return cpShader;
         }
@@ -469,6 +536,8 @@ namespace Ryujinx.Graphics.Gpu.Shader
             }
 
             _gpPrograms[addresses] = gpShaders;
+
+            CheckMemoryPressure();
 
             return gpShaders;
         }

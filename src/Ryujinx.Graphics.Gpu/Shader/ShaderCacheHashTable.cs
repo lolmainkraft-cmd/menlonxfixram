@@ -133,6 +133,15 @@ namespace Ryujinx.Graphics.Gpu.Shader
 
         private readonly Dictionary<IdTable, ShaderSpecializationList> _shaderPrograms;
 
+        // LRU tracking: most recently used at front, least recently used at back
+        private readonly LinkedList<IdTable> _lruList;
+        private readonly Dictionary<IdTable, LinkedListNode<IdTable>> _lruNodes;
+
+        /// <summary>
+        /// Number of unique shader combinations currently cached.
+        /// </summary>
+        public int ShaderComboCount => _lruList.Count;
+
         /// <summary>
         /// Creates a new graphics shader cache hash table.
         /// </summary>
@@ -146,6 +155,8 @@ namespace Ryujinx.Graphics.Gpu.Shader
             _fragmentCache.Initialize();
 
             _shaderPrograms = new Dictionary<IdTable, ShaderSpecializationList>();
+            _lruList = new LinkedList<IdTable>();
+            _lruNodes = new Dictionary<IdTable, LinkedListNode<IdTable>>();
         }
 
         /// <summary>
@@ -197,6 +208,18 @@ namespace Ryujinx.Graphics.Gpu.Shader
             }
 
             specList.Add(program);
+
+            // Add to LRU if this is a new shader combo, move to front if it already exists
+            if (_lruNodes.TryGetValue(idTable, out var existingNode))
+            {
+                _lruList.Remove(existingNode);
+                _lruList.AddFirst(existingNode);
+            }
+            else
+            {
+                var node = _lruList.AddFirst(idTable);
+                _lruNodes[idTable] = node;
+            }
         }
 
         /// <summary>
@@ -236,10 +259,56 @@ namespace Ryujinx.Graphics.Gpu.Shader
 
             if (found && _shaderPrograms.TryGetValue(idTable, out ShaderSpecializationList specList))
             {
-                return specList.TryFindForGraphics(channel, ref poolState, ref graphicsState, out program);
+                bool programFound = specList.TryFindForGraphics(channel, ref poolState, ref graphicsState, out program);
+
+                // Update LRU: move to front on cache hit
+                if (programFound && _lruNodes.TryGetValue(idTable, out var lruNode))
+                {
+                    _lruList.Remove(lruNode);
+                    _lruList.AddFirst(lruNode);
+                }
+
+                return programFound;
             }
 
             return false;
+        }
+
+        /// <summary>
+        /// Evicts the least recently used shader combos and returns the programs that were removed.
+        /// Call Dispose() on each returned program after calling this.
+        /// </summary>
+        /// <param name="count">Number of shader combos (IdTable entries) to evict</param>
+        /// <returns>List of evicted programs that should be disposed</returns>
+        public List<CachedShaderProgram> EvictLeastRecentlyUsed(int count)
+        {
+            var evicted = new List<CachedShaderProgram>();
+            var node = _lruList.Last;
+            int processed = 0;
+
+            while (node != null && processed < count)
+            {
+                var prev = node.Previous;
+                IdTable idTable = node.Value;
+
+                if (_shaderPrograms.TryGetValue(idTable, out var specList))
+                {
+                    foreach (var program in specList)
+                    {
+                        evicted.Add(program);
+                    }
+
+                    _shaderPrograms.Remove(idTable);
+                }
+
+                _lruList.Remove(node);
+                _lruNodes.Remove(idTable);
+
+                node = prev;
+                processed++;
+            }
+
+            return evicted;
         }
 
         /// <summary>
