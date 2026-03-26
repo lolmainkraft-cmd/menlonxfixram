@@ -11,6 +11,7 @@ using Ryujinx.Graphics.Shader.Translation;
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 
 namespace Ryujinx.Graphics.Gpu.Shader
@@ -25,16 +26,21 @@ namespace Ryujinx.Graphics.Gpu.Shader
         /// </summary>
         public const TranslationFlags DefaultFlags = TranslationFlags.DebugMode;
 
-        // Memory pressure thresholds (bytes). Eviction kicks in progressively
-        // to keep RAM usage between ~6.8 GB and ~7.7 GB on 8 GB devices.
-        private const long EvictThreshold1 = (long)(7.0 * 1024 * 1024 * 1024); // 20% evict
-        private const long EvictThreshold2 = (long)(7.3 * 1024 * 1024 * 1024); // 40% evict
-        private const long EvictThreshold3 = (long)(7.5 * 1024 * 1024 * 1024); // 60% evict
-        private const long EvictThreshold4 = (long)(7.7 * 1024 * 1024 * 1024); // 75% evict (emergency)
+        // Available memory thresholds (bytes) — iOS reports how much is LEFT before kill.
+        // Crash happens at ~7.99 GB used on 8 GB device, so ~10-50 MB available at crash.
+        // We evict progressively as available memory drops.
+        private const long AvailThreshold1 = (long)(1.0 * 1024 * 1024 * 1024); // ~7.0 GB used → 20%
+        private const long AvailThreshold2 = (long)(700 * 1024 * 1024);         // ~7.3 GB used → 40%
+        private const long AvailThreshold3 = (long)(500 * 1024 * 1024);         // ~7.5 GB used → 60%
+        private const long AvailThreshold4 = (long)(300 * 1024 * 1024);         // ~7.7 GB used → 75%
 
-        // Minimum time between eviction passes to avoid thrashing
+        // Minimum time between memory checks to avoid overhead
         private static readonly TimeSpan EvictionCooldown = TimeSpan.FromSeconds(2);
         private DateTime _lastEviction = DateTime.MinValue;
+
+        // iOS native API: returns bytes available to this process before jetsam kills it
+        [DllImport("libSystem.dylib")]
+        private static extern ulong os_proc_available_memory();
 
         private readonly struct TranslatedShader
         {
@@ -208,17 +214,26 @@ namespace Ryujinx.Graphics.Gpu.Shader
                 return;
             }
 
-            // Always update timestamp so WorkingSet is only called once per cooldown period
+            // Always update timestamp so memory check runs at most once per cooldown period
             _lastEviction = now;
 
-            long usedMemory = Environment.WorkingSet;
-
-            double evictRatio = usedMemory switch
+            long availableMemory;
+            try
             {
-                >= EvictThreshold4 => 0.75,
-                >= EvictThreshold3 => 0.60,
-                >= EvictThreshold2 => 0.40,
-                >= EvictThreshold1 => 0.20,
+                availableMemory = (long)os_proc_available_memory();
+            }
+            catch
+            {
+                // Not on iOS or API unavailable — skip eviction
+                return;
+            }
+
+            double evictRatio = availableMemory switch
+            {
+                <= AvailThreshold4 => 0.75,
+                <= AvailThreshold3 => 0.60,
+                <= AvailThreshold2 => 0.40,
+                <= AvailThreshold1 => 0.20,
                 _ => 0.0
             };
 
@@ -248,8 +263,8 @@ namespace Ryujinx.Graphics.Gpu.Shader
             // Clear fast-path dict — entries may point to now-disposed programs
             _gpPrograms.Clear();
 
-            long ramMB = Environment.WorkingSet / (1024 * 1024);
-            Logger.Info?.Print(LogClass.Gpu, $"[RamFix] Evicted {evicted.Count} shader programs ({toEvict} combos, ratio {ratio:P0}). RAM after: {ramMB} MB");
+            long availMB = (long)os_proc_available_memory() / (1024 * 1024);
+            Logger.Info?.Print(LogClass.Gpu, $"[RamFix] Evicted {evicted.Count} shader programs ({toEvict} combos, ratio {ratio:P0}). Available RAM after: {availMB} MB");
         }
 
         /// <summary>
