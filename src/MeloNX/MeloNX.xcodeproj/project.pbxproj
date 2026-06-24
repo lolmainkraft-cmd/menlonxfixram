@@ -2506,7 +2506,8 @@
 					"$(PROJECT_DIR)/MeloNX/Dependencies/Dynamic\\ Libraries",
 				);
 				MARKETING_VERSION = "$(VERSION)";
-				PRODUCT_BUNDLE_IDENTIFIER = "com.stossy11.personal.PLS-DONT-TAKE.MeloNX";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.stossy11.personal.PLS-DONT-TAKE.MeloNXdiag";
+				INFOPLIST_KEY_CFBundleDisplayName = "MeloNX Diag";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
@@ -3365,7 +3366,8 @@
 					"$(PROJECT_DIR)/MeloNX/Dependencies/Dynamic\\ Libraries",
 				);
 				MARKETING_VERSION = "$(VERSION)";
-				PRODUCT_BUNDLE_IDENTIFIER = "com.stossy11.personal.PLS-DONT-TAKE.MeloNX";
+				PRODUCT_BUNDLE_IDENTIFIER = "com.stossy11.personal.PLS-DONT-TAKE.MeloNXdiag";
+				INFOPLIST_KEY_CFBundleDisplayName = "MeloNX Diag";
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
 				SUPPORTS_MACCATALYST = NO;
