@@ -133,10 +133,18 @@ class Ryujinx : ObservableObject {
         
         
         self.config = config
-        
+
         self.isRunning = true
-        
-        
+
+        // --- Audit: record what we're launching and from where ---
+        let docsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? ""
+        let isExternal = !config.gamepath.contains(docsPath)
+        DiagnosticsLogger.shared.event("LAUNCH", "rom=\(URL(string: config.gamepath)?.lastPathComponent ?? config.gamepath) source=\(isExternal ? "EXTERNAL" : "internal")")
+        if let probeURL = URL(string: config.gamepath) {
+            DiagnosticsLogger.shared.probeReadLatency(probeURL)
+        }
+        DiagnosticsLogger.shared.startSampling()
+
         runloop { [self] in
             let url = URL(string: config.gamepath)
             
@@ -147,7 +155,9 @@ class Ryujinx : ObservableObject {
                 // Start the emulation
                 if isRunning {
                     let result = RyujinxBridge.mainRyu(argv: args)//main_ryujinx_sdl(Int32(args.count), &argvPtrs)
-                    
+                    DiagnosticsLogger.shared.event("LAUNCH", "emulation returned code=\(result)")
+                    DiagnosticsLogger.shared.stopSampling()
+
                     if result != 0 {
                         Task { @MainActor in
                             self.isRunning = false
@@ -160,10 +170,12 @@ class Ryujinx : ObservableObject {
                     }
                 }
             } catch {
+                DiagnosticsLogger.shared.event("LAUNCH", "exception: \(error)")
+                DiagnosticsLogger.shared.stopSampling()
                 Task { @MainActor in
                     self.isRunning = false
                 }
-                
+
                 Thread.sleep(forTimeInterval: 0.3)
                 let logs = LogCapture.shared.capturedLogs
                 let parsedLogs = extractExceptionInfo(logs)
@@ -352,7 +364,10 @@ class Ryujinx : ObservableObject {
         
         var games: [Game] = []
         
+        let docsBase = documentsDirectory.path
         for romsDirectory in romdirs {
+            let external = !romsDirectory.path.contains(docsBase)
+            DiagnosticsLogger.shared.event("ROM", "scanning \(external ? "EXTERNAL" : "internal") dir: \(romsDirectory.path)")
             if let enumerator = fileManager.enumerator(at: romsDirectory, includingPropertiesForKeys: nil) {
                 for case let fileURL as URL in enumerator {
                     if !GameFileType.isSupported(fileExtension: fileURL.pathExtension) {
