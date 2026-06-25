@@ -139,19 +139,26 @@ class Ryujinx : ObservableObject {
         // --- Audit: record what we're launching and from where ---
         let docsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?.path ?? ""
         let isExternal = !config.gamepath.contains(docsPath)
-        DiagnosticsLogger.shared.event("LAUNCH", "rom=\(URL(string: config.gamepath)?.lastPathComponent ?? config.gamepath) source=\(isExternal ? "EXTERNAL" : "internal")")
-        if let probeURL = URL(string: config.gamepath) {
-            DiagnosticsLogger.shared.probeReadLatency(probeURL)
-        }
+        // Use fileURLWithPath: URL(string:) returns nil for paths containing
+        // spaces (e.g. TOTK), which previously meant the security scope was
+        // never acquired and the native emulator hung opening the ROM.
+        let romFileURL = URL(fileURLWithPath: config.gamepath)
+        DiagnosticsLogger.shared.event("LAUNCH", "rom=\(romFileURL.lastPathComponent) source=\(isExternal ? "EXTERNAL" : "internal")")
+        DiagnosticsLogger.shared.probeReadLatency(romFileURL)
         DiagnosticsLogger.shared.startSampling()
 
+        // Hold the security scope of the bookmarked ROM folder that contains
+        // this game for the whole session, so the native runtime can read it.
+        let folderScopeURL = Self.acquireFolderScope(forGameAt: config.gamepath)
+
         runloop { [self] in
-            let url = URL(string: config.gamepath)
-            
+            let url = romFileURL
+
             do {
                 let args = self.buildCommandLineArgs(from: config)
-                let accessing = url?.startAccessingSecurityScopedResource()
-                
+                let accessing = url.startAccessingSecurityScopedResource()
+                DiagnosticsLogger.shared.event("LAUNCH", "fileScope=\(accessing) folderScope=\(folderScopeURL != nil)")
+
                 // Start the emulation
                 if isRunning {
                     let result = RyujinxBridge.mainRyu(argv: args)//main_ryujinx_sdl(Int32(args.count), &argvPtrs)
@@ -162,10 +169,11 @@ class Ryujinx : ObservableObject {
                         Task { @MainActor in
                             self.isRunning = false
                         }
-                        if let accessing, accessing {
-                            url!.stopAccessingSecurityScopedResource()
+                        if accessing {
+                            url.stopAccessingSecurityScopedResource()
                         }
-                        
+                        folderScopeURL?.stopAccessingSecurityScopedResource()
+
                         throw RyujinxError.executionError(code: Int32(result))
                     }
                 }
@@ -396,6 +404,24 @@ class Ryujinx : ObservableObject {
     }
     
     
+    /// Resolve the ROM-folder bookmark that contains `gamePath` and start
+    /// accessing its security-scoped resource, returning the URL so the caller
+    /// can release it when emulation ends. This guarantees the native runtime
+    /// can read a ROM loaded in-place from an external/bookmarked folder.
+    static func acquireFolderScope(forGameAt gamePath: String) -> URL? {
+        let manager = ROMFolderManager.shared
+        manager.loadBookmarks()
+        for bookmark in manager.bookmarks {
+            guard let folderURL = manager.getUrl(from: bookmark) else { continue }
+            if gamePath.hasPrefix(folderURL.path) {
+                let ok = folderURL.startAccessingSecurityScopedResource()
+                DiagnosticsLogger.shared.event("LAUNCH", "folder scope \(ok ? "acquired" : "FAILED") for \(folderURL.lastPathComponent)")
+                return ok ? folderURL : nil
+            }
+        }
+        return nil
+    }
+
     func buildCommandLineArgs(from config: Arguments) -> [String] {
         var args: [String] = []
         

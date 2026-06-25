@@ -109,6 +109,19 @@ final class DiagnosticsLogger {
             line += String(format: " available=%.0f MB", Double(avail) / 1_048_576.0)
         }
         event("MEM", line)
+        dumpEngineLogs()
+    }
+
+    /// Mirror the in-memory Ryujinx engine logs (captured by LogCapture) to a
+    /// file so they survive a hang and can be exported via the Files app. The
+    /// stdout-redirected MeloNX-App-Log stays empty because LogCapture owns the
+    /// pipe, so this is the only on-disk copy of what the emulator is doing.
+    private func dumpEngineLogs() {
+        let logs = LogCapture.shared.capturedLogs
+        guard !logs.isEmpty else { return }
+        let text = logs.suffix(2000).joined(separator: "\n")
+        let url = fileURL.deletingLastPathComponent().appendingPathComponent("melonx_engine.log")
+        try? text.data(using: .utf8)?.write(to: url, options: .atomic)
     }
 
     static func physFootprint() -> UInt64 {
