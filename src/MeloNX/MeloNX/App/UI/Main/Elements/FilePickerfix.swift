@@ -174,8 +174,9 @@ extension UIDocumentPickerViewController {
 
         // Folders can only be opened in-place; iOS throws if asCopy is true
         // for a folder content type. Keep the folder type and force
-        // asCopy:false so external ROM folders can be picked.
-        let isFolder = contentTypes.contains(.folder)
+        // asCopy:false so external ROM folders can be picked. Robust match
+        // because UTType equality can misbehave under the UTType swizzle.
+        let isFolder = contentTypes.contains { $0 == .folder || $0.identifier == "public.folder" || $0.conforms(to: .folder) }
 
         let picker = hook_initForOpeningContentTypes(
             contentTypes,
