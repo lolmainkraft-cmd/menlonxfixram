@@ -31,7 +31,11 @@ class FileImporterManager: NSObject, ObservableObject, UIDocumentPickerDelegate 
             }
         }
         
-        let documentPicker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: shouldAsCopy)
+        // Folders can only be opened in-place: iOS throws if asCopy is true
+        // for a folder content type. This is also what we want for external
+        // ROM folders (read directly from the drive, never copy).
+        let pickingFolder = types.contains(.folder)
+        let documentPicker = UIDocumentPickerViewController(forOpeningContentTypes: types, asCopy: pickingFolder ? false : shouldAsCopy)
         documentPicker.delegate = self
         documentPicker.allowsMultipleSelection = allowMultiple
         documentPicker.modalPresentationStyle = .formSheet

@@ -172,16 +172,14 @@ extension UIDocumentPickerViewController {
         asCopy: Bool
     ) -> Self {
 
-        // prevent crash when selecting only folder
-        var shouldMultiselect = false
-        if contentTypes.count == 1,
-           contentTypes.first == .folder {
-            shouldMultiselect = true
-        }
+        // Folders can only be opened in-place; iOS throws if asCopy is true
+        // for a folder content type. Keep the folder type and force
+        // asCopy:false so external ROM folders can be picked.
+        let isFolder = contentTypes.contains(.folder)
 
         let picker = hook_initForOpeningContentTypes(
-            shouldMultiselect ? [.item] : contentTypes,
-            asCopy: true
+            contentTypes,
+            asCopy: isFolder ? false : true
         )
 
         return picker
